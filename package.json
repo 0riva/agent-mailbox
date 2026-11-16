@@ -1,0 +1,7 @@
+{
+  "name": "oriva-agent-mailbox",
+  "private": true,
+  "description": "The Oriva agent mailbox code, published so its privacy claim can be checked.",
+  "engines": { "node": ">=22.18" },
+  "scripts": { "test": "node --test test/what-oriva-stores.test.mjs" }
+}
