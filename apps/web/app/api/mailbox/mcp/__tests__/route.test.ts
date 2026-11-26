@@ -111,3 +111,43 @@ it('has no event stream, and answers CORS preflight', () => {
   expect(route.GET().status).toBe(405);
   expect(route.OPTIONS().status).toBe(204);
 });
+
+describe('protocol revision 2026-07-28 at the door (o-core#2367)', () => {
+  const envelope = { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} };
+  const modern = (body: unknown, headers: Record<string, string>) =>
+    route.POST(new Request('https://oriva.io/api/mailbox/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, 'mcp-protocol-version': '2026-07-28', ...headers },
+      body: JSON.stringify(body),
+    }));
+
+  it('answers discovery with the status and body the new path decides', async () => {
+    const res = await modern({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: { _meta: envelope } }, { 'mcp-method': 'server/discover' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).result.supportedVersions).toEqual(['2026-07-28']);
+  });
+
+  it('passes a header mismatch through as 400 and an unknown method as 404', async () => {
+    const bad = await modern({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: envelope } }, { 'mcp-method': 'tools/call' });
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error.code).toBe(-32020);
+    const missing = await modern({ jsonrpc: '2.0', id: 2, method: 'prompts/list', params: { _meta: envelope } }, { 'mcp-method': 'prompts/list' });
+    expect(missing.status).toBe(404);
+  });
+
+  it('refuses a 2026-07-28 request inside a batch', async () => {
+    const res = await post([{ jsonrpc: '2.0', id: 1, method: 'server/discover', params: { _meta: envelope } }, { jsonrpc: '2.0', id: 2, method: 'ping' }]);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe(-32600);
+  });
+
+  it('answers a 2026-07-28 notification 202 with no body', async () => {
+    const res = await modern({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { _meta: envelope } }, { 'mcp-method': 'notifications/cancelled' });
+    expect(res.status).toBe(202);
+    expect(await res.text()).toBe('');
+  });
+
+  it('lets the new headers through a browser preflight', () => {
+    expect(route.OPTIONS().headers.get('access-control-allow-headers')).toMatch(/Mcp-Method, Mcp-Name/);
+  });
+});

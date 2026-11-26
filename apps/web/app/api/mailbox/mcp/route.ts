@@ -7,6 +7,7 @@ import { serviceRoleClient } from '../../_lib/serviceRoleClient';
 import { hashToken } from '../../../../lib/mailbox/crypto';
 import { PUBLIC_CORS, json, preflight } from '../../../../lib/mailbox/http';
 import { REQUESTS_PER_MINUTE, handleRpc } from '../../../../lib/mailbox/mcp';
+import { handleModern, isModern } from '../../../../lib/mailbox/modern';
 import { mailboxOrigin } from '../../../../lib/mailbox/oauth';
 import { rpcStore } from '../../../../lib/mailbox/store';
 
@@ -54,6 +55,20 @@ export async function POST(request: Request) {
     }
 
     const ctx = { store, caller, accessToken: token };
+
+    // Protocol revision 2026-07-28 (o-core#2367): one request per POST, answered by modern.ts with the
+    // HTTP status the revision requires. Everything else is the 2025-era path below, unchanged.
+    if (batch.some(isModern)) {
+      if (Array.isArray(body)) return json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'A 2026-07-28 request cannot be sent in a batch.' } }, 400);
+      try {
+        const answer = await handleModern(ctx, body as Parameters<typeof handleModern>[1], request.headers);
+        return answer.body ? json(answer.body, answer.status) : new Response(null, { status: 202, headers: PUBLIC_CORS });
+      } catch (error) {
+        console.error('[mailbox] mcp modern item failed', error instanceof Error ? error.message : error);
+        return json({ jsonrpc: '2.0', id: (body as { id?: unknown })?.id ?? null, error: { code: -32603, message: 'Something went wrong. Try again.' } }, 500);
+      }
+    }
+
     const out = [];
     for (const req of batch) {
       // One failing item does not fail the others (they may already have marked mail read).

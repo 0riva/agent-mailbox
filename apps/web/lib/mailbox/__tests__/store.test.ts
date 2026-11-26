@@ -146,3 +146,35 @@ it('reads where messages came from, and asks nothing for an empty list', async (
   expect((await s.messageOrigins('c1', [])).size).toBe(0);
   expect(calls.length).toBe(before);
 });
+
+it('reaches the task functions and turns a result row into a sealed message (o-core#2367)', async () => {
+  const row = {
+    created_at: '2026-11-25T10:00:00Z', delete_after: '2026-12-25T10:00:00Z', fetched_at: '2026-11-25T10:05:00Z', withdrawn_at: null,
+    worker_stopped: false, held: true,
+    result_id: 'r1', result_user_id: 'u', result_from: 'w', result_from_name: 'Grok Bot',
+    result_ephemeral_public_key: 'aa', result_nonce: 'bb', result_ciphertext: 'cc', result_created_at: '2026-11-25T11:00:00Z',
+  };
+  const { db, calls } = fakeDb({ mailbox_task_state: [row], mailbox_withdraw_task: 'withdrawn', mailbox_task_withdrawn: true });
+  const s = rpcStore(db);
+  const state = await s.taskState('c1', 't1');
+  expect(calls[0]).toEqual(['mailbox_task_state', { p_connection: 'c1', p_task: 't1' }]);
+  expect(state).toEqual({
+    createdAt: '2026-11-25T10:00:00Z', deleteAfter: '2026-12-25T10:00:00Z', fetchedAt: '2026-11-25T10:05:00Z', withdrawnAt: null,
+    workerStopped: false, held: true,
+    result: { id: 'r1', userId: 'u', fromConnection: 'w', fromName: 'Grok Bot', kind: 'result', replyTo: 't1', ephemeralPublicKey: b('aa'), nonce: b('bb'), ciphertext: b('cc'), createdAt: '2026-11-25T11:00:00Z' },
+  });
+  expect(await s.withdrawTask('c1', 't1')).toBe('withdrawn');
+  expect(calls[1]).toEqual(['mailbox_withdraw_task', { p_connection: 'c1', p_task: 't1' }]);
+  expect(await s.taskWithdrawn('c2', 't1')).toBe(true);
+  expect(calls[2]).toEqual(['mailbox_task_withdrawn', { p_connection: 'c2', p_task: 't1' }]);
+});
+
+it('answers a task with no result yet as result null, a task it did not give as null, and raises database errors', async () => {
+  const waiting = { created_at: 'a', delete_after: 'b', fetched_at: null, withdrawn_at: null, worker_stopped: true, held: false, result_id: null, result_user_id: null, result_from: null, result_from_name: null, result_ephemeral_public_key: null, result_nonce: null, result_ciphertext: null, result_created_at: null };
+  const w = await rpcStore(fakeDb({ mailbox_task_state: [waiting] }).db).taskState('c1', 't1');
+  expect(w?.result).toBeNull();
+  expect(w?.workerStopped).toBe(true);
+  expect(await rpcStore(fakeDb({ mailbox_task_state: [] }).db).taskState('c1', 't1')).toBeNull();
+  await expect(rpcStore(fakeDb({}, 'boom').db).taskState('c1', 't1')).rejects.toThrow('boom');
+  await expect(rpcStore(fakeDb({}, 'boom').db).withdrawTask('c1', 't1')).rejects.toThrow('boom');
+});

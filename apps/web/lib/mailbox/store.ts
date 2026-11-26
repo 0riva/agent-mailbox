@@ -107,6 +107,21 @@ export interface NewMessage {
   size: number;
 }
 
+/** Where a task this agent gave has got to (o-core#2367). The result is sealed to the giver, as in its inbox. */
+export interface TaskState {
+  createdAt: string;
+  deleteAfter: string;
+  fetchedAt: string | null;
+  withdrawnAt: string | null;
+  /** The worker it was given to has been disconnected, so it can never be answered. */
+  workerStopped: boolean;
+  /** A shared project is holding it back (a company stopped handovers, or an agent left the project). */
+  held: boolean;
+  result: StoredMessage | null;
+}
+
+export type WithdrawOutcome = 'withdrawn' | 'answered' | 'not_found';
+
 export interface MailboxStore {
   registerClient(clientId: string, name: string, redirectUris: string[]): Promise<void>;
   client(clientId: string): Promise<ClientRecord | null>;
@@ -131,6 +146,11 @@ export interface MailboxStore {
   markRead(connectionId: string, ids: string[]): Promise<number>;
   /** Who sent a message addressed to this agent; null for a message addressed to anyone else. */
   messageSender(connectionId: string, messageId: string): Promise<{ fromConnection: string; kind: MessageKind } | null>;
+  /** A task this agent gave, or null for any message it did not give as a task. */
+  taskState(connectionId: string, taskId: string): Promise<TaskState | null>;
+  withdrawTask(connectionId: string, taskId: string): Promise<WithdrawOutcome>;
+  /** Whether a task addressed to this agent was withdrawn by the agent that gave it. */
+  taskWithdrawn(connectionId: string, taskId: string): Promise<boolean>;
   overview(userId: string): Promise<unknown>;
   // Shared projects (o-core#2142): agents of other companies, reached only inside a project.
   projectPeers(connectionId: string): Promise<ProjectPeer[]>;
@@ -247,6 +267,33 @@ export function rpcStore(db: SupabaseClient): MailboxStore {
     },
     async markRead(connectionId, ids) {
       return call<number>('mailbox_mark_read', { p_connection: connectionId, p_ids: ids });
+    },
+    async taskState(connectionId, taskId) {
+      const row = first(await call<Array<{
+        created_at: string; delete_after: string; fetched_at: string | null; withdrawn_at: string | null;
+        worker_stopped: boolean; held: boolean;
+        result_id: string | null; result_user_id: string | null; result_from: string | null; result_from_name: string | null;
+        result_ephemeral_public_key: string | null; result_nonce: string | null; result_ciphertext: string | null; result_created_at: string | null;
+      }>>('mailbox_task_state', { p_connection: connectionId, p_task: taskId }));
+      if (!row) return null;
+      const result: StoredMessage | null = row.result_id
+        ? {
+            id: row.result_id, userId: row.result_user_id ?? '', fromConnection: row.result_from ?? '', fromName: row.result_from_name ?? '',
+            kind: 'result', replyTo: taskId,
+            ephemeralPublicKey: unhex(row.result_ephemeral_public_key ?? ''), nonce: unhex(row.result_nonce ?? ''),
+            ciphertext: unhex(row.result_ciphertext ?? ''), createdAt: row.result_created_at ?? row.created_at,
+          }
+        : null;
+      return {
+        createdAt: row.created_at, deleteAfter: row.delete_after, fetchedAt: row.fetched_at, withdrawnAt: row.withdrawn_at,
+        workerStopped: row.worker_stopped === true, held: row.held === true, result,
+      };
+    },
+    async withdrawTask(connectionId, taskId) {
+      return call<WithdrawOutcome>('mailbox_withdraw_task', { p_connection: connectionId, p_task: taskId });
+    },
+    async taskWithdrawn(connectionId, taskId) {
+      return call<boolean>('mailbox_task_withdrawn', { p_connection: connectionId, p_task: taskId });
     },
     async projectPeers(connectionId) {
       const rows = await call<Array<{ id: string; role: Role; agent_name: string; public_key: string; project_id: string; project_name: string; company_name: string }>>(

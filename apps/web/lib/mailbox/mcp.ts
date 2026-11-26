@@ -146,6 +146,10 @@ async function send(ctx: McpContext, to: Target, kind: MessageKind, body: string
     if (error instanceof Error && error.message.includes('mailbox_full')) {
       throw new ToolError(`${to.agentName} has 20 MB of messages it has not read yet. Wait until it catches up.`);
     }
+    if (error instanceof Error && error.message.includes('task_withdrawn')) {
+      // The database refuses a result to a withdrawn task even when the withdrawal lands mid-report (o-core#2367).
+      throw new ToolError(`The agent that gave task ${replyTo} withdrew it, so your result was not sent. You can stop working on it.`);
+    }
     if (error instanceof Error && error.message.includes('project_handover_refused')) {
       throw new ToolError(`${to.agentName} cannot be reached in "${to.projectName}" right now: a company stopped agent handovers there, or an agent was withdrawn from it.`);
     }
@@ -155,7 +159,7 @@ async function send(ctx: McpContext, to: Target, kind: MessageKind, body: string
 }
 
 /** Who a message is from, as the message itself records it: another company's messages say which company and project. */
-async function senderLabels(ctx: McpContext, messages: StoredMessage[]): Promise<(m: StoredMessage) => string> {
+export async function senderLabels(ctx: McpContext, messages: StoredMessage[]): Promise<(m: StoredMessage) => string> {
   const origins = await ctx.store.messageOrigins(ctx.caller.id, messages.map((m) => m.id));
   return (m) => {
     const o = origins.get(m.id);
@@ -164,7 +168,7 @@ async function senderLabels(ctx: McpContext, messages: StoredMessage[]): Promise
 }
 
 /** Open this agent's own messages. One that will not open (altered in storage) is reported, not returned. */
-function opener(ctx: McpContext) {
+export function opener(ctx: McpContext) {
   let privateKey: Buffer | null = null;
   return (m: StoredMessage): string | null => {
     privateKey ??= unwrapPrivateKey(ctx.caller.wrapped, ctx.accessToken);
@@ -178,6 +182,14 @@ function opener(ctx: McpContext) {
       return null;
     }
   };
+}
+
+/** Give a task to a worker: shared by the classic answer above and the background-task answer (o-core#2367). */
+export async function postTask(ctx: McpContext, args: Record<string, unknown>): Promise<{ id: string; agentName: string }> {
+  const body = text(args.text, 'text');
+  const to = await resolve(ctx, 'worker', args.to, args.project);
+  const id = await send(ctx, to, 'task', body, null);
+  return { id, agentName: to.agentName };
 }
 
 export async function callTool(ctx: McpContext, name: string, args: Record<string, unknown>): Promise<string> {
@@ -198,10 +210,8 @@ export async function callTool(ctx: McpContext, name: string, args: Record<strin
   const named = (v: unknown) => typeof v === 'string' && v.trim() !== '';
 
   if (name === 'post_task') {
-    const body = text(args.text, 'text');
-    const to = await resolve(ctx, 'worker', args.to, args.project);
-    const id = await send(ctx, to, 'task', body, null);
-    return `Task ${id} sent to ${to.agentName}. Its result will arrive through read_replies.`;
+    const { id, agentName } = await postTask(ctx, args);
+    return `Task ${id} sent to ${agentName}. Its result will arrive through read_replies.`;
   }
 
   if (name === 'read_replies') {
@@ -236,6 +246,9 @@ export async function callTool(ctx: McpContext, name: string, args: Record<strin
     if (!/^[0-9a-f-]{36}$/.test(taskId)) throw new ToolError('`task_id` must be the id next_task gave you.');
     const sender = await store.messageSender(caller.id, taskId);
     if (!sender || sender.kind !== 'task') throw new ToolError(`Task ${taskId} was not given to you.`);
+    if (await store.taskWithdrawn(caller.id, taskId)) {
+      throw new ToolError(`The agent that gave task ${taskId} withdrew it, so your result was not sent. You can stop working on it.`);
+    }
     // A task that came through a shared project is answered through that same project.
     const projectId = await store.messageProject(caller.id, taskId);
     const to: Target | undefined = projectId

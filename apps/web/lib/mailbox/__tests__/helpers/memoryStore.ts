@@ -4,7 +4,8 @@
  * token rotates once (compare-and-swap), a stopped agent has no tokens or keys, messages go only
  * between active agents on one account — or, through a shared project, between agents shared into it
  * while no company has stopped handovers there (o-core#2142). The database side of each rule is
- * proven separately by `pnpm test:agent-mailbox` and `pnpm test:mailbox-project-handover`.
+ * proven separately by `pnpm test:agent-mailbox` and `pnpm test:mailbox-project-handover`; the task rules
+ * (state, withdrawal, a withdrawn task never delivered — o-core#2367) by `pnpm test:mailbox-tasks`.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -23,7 +24,13 @@ export function memoryStore() {
   const clients = new Map<string, { clientName: string; redirectUris: string[] }>();
   const codes = new Map<string, { clientId: string; userId: string; role: Role; redirectUri: string; challenge: string; expiresAt: number; agentName: string | null }>();
   const conns = new Map<string, Conn>();
-  const messages: Array<NewMessage & { userId: string; readAt: number | null; createdAt: string; projectId?: string }> = [];
+  const messages: Array<NewMessage & { userId: string; readAt: number | null; createdAt: string; projectId?: string; withdrawnAt?: number }> = [];
+  const iso = (t: number | null | undefined) => (t ? new Date(t).toISOString() : null);
+  // As the database trigger does: a message is kept 30 days, or 7 days after it is read.
+  const deleteAfter = (m: { createdAt: string; readAt: number | null }) =>
+    new Date(Math.min(Date.parse(m.createdAt) + 30 * 86_400_000, m.readAt ? m.readAt + 7 * 86_400_000 : Infinity)).toISOString();
+  const visible = (m: { projectId?: string; from: string; to: string }) =>
+    !m.projectId || (shareCompany(m.projectId, m.from) && shareCompany(m.projectId, m.to));
   // Shared projects: which companies are in each, who is in each company, which agents are shared, and stops.
   const projects = new Map<string, { name: string; companies: Map<string, { name: string; members: Set<string>; active: boolean }> }>();
   const shares: Array<{ projectId: string; connectionId: string; companyId: string; withdrawn: boolean }> = [];
@@ -132,13 +139,14 @@ export function memoryStore() {
       const from = conns.get(m.from);
       const to = conns.get(m.to);
       if (!from || !to || from.stopped || to.stopped || from.userId !== to.userId) throw new Error('sender and receiver must be active agents on the same account');
+      if (m.kind === 'result' && m.replyTo && messages.find((x) => x.id === m.replyTo)?.withdrawnAt) throw new Error('[mailbox] mailbox_post: task_withdrawn');
       const unread = messages.filter((x) => x.to === m.to && x.readAt === null).reduce((n, x) => n + x.size, 0);
       if (unread + m.size > 20_971_520) throw new Error('[mailbox] mailbox_post: mailbox_full');
       messages.push({ ...m, userId: from.userId, readAt: null, createdAt: new Date(now()).toISOString() });
     },
     async inbox(connectionId, kinds, limit) {
       return messages
-        .filter((m) => m.to === connectionId && m.readAt === null && (!kinds || kinds.includes(m.kind)))
+        .filter((m) => m.to === connectionId && m.readAt === null && !m.withdrawnAt && (!kinds || kinds.includes(m.kind)))
         // Project mail is held while either agent cannot reach the other there (stop, withdrawal, departure).
         .filter((m) => !m.projectId || (shareCompany(m.projectId, m.from) && shareCompany(m.projectId, m.to)))
         .slice(0, limit)
@@ -155,6 +163,34 @@ export function memoryStore() {
     async messageSender(connectionId, messageId) {
       const m = messages.find((x) => x.id === messageId && x.to === connectionId);
       return m ? { fromConnection: m.from, kind: m.kind } : null;
+    },
+    async taskState(connectionId, taskId) {
+      const t = messages.find((x) => x.id === taskId && x.from === connectionId && x.kind === 'task');
+      if (!t) return null;
+      const r = messages.find((x) => x.replyTo === taskId && x.kind === 'result' && x.to === connectionId && visible(x));
+      return {
+        createdAt: t.createdAt, deleteAfter: deleteAfter(t),
+        // As the database: a task withdrawn before it was fetched is marked read at that same moment.
+        fetchedAt: !t.withdrawnAt || (t.readAt !== null && t.readAt < t.withdrawnAt) ? iso(t.readAt) : null,
+        withdrawnAt: iso(t.withdrawnAt),
+        workerStopped: !!conns.get(t.to)?.stopped,
+        held: !visible(t),
+        result: r
+          ? { id: r.id, userId: r.userId, fromConnection: r.from, fromName: conns.get(r.from)?.agentName ?? '', kind: 'result', replyTo: taskId,
+              ephemeralPublicKey: r.ephemeralPublicKey, nonce: r.nonce, ciphertext: r.ciphertext, createdAt: r.createdAt }
+          : null,
+      };
+    },
+    async withdrawTask(connectionId, taskId) {
+      const t = messages.find((x) => x.id === taskId && x.from === connectionId && x.kind === 'task');
+      if (!t) return 'not_found';
+      if (messages.some((x) => x.replyTo === taskId && x.kind === 'result')) return 'answered';
+      t.withdrawnAt ??= now();
+      t.readAt ??= t.withdrawnAt;
+      return 'withdrawn';
+    },
+    async taskWithdrawn(connectionId, taskId) {
+      return !!messages.find((x) => x.id === taskId && x.to === connectionId && x.kind === 'task')?.withdrawnAt;
     },
     async overview(userId) {
       return { agents: [...conns.values()].filter((c) => c.userId === userId).map((c) => ({ id: c.id, name: c.agentName, role: c.role })), activity: [] };
@@ -180,6 +216,7 @@ export function memoryStore() {
       if (!from || !to || from.stopped || to.stopped || from.userId === to.userId || !shareCompany(m.projectId, m.from) || !shareCompany(m.projectId, m.to)) {
         throw new Error('[mailbox] mailbox_post_in_project: project_handover_refused');
       }
+      if (m.kind === 'result' && m.replyTo && messages.find((x) => x.id === m.replyTo)?.withdrawnAt) throw new Error('[mailbox] mailbox_post: task_withdrawn');
       if (m.replyTo && !messages.some((x) => x.id === m.replyTo && x.to === m.from && x.projectId === m.projectId)) {
         throw new Error('reply_to is not a message this agent received in this project');
       }

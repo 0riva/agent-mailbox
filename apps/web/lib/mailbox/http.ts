@@ -10,7 +10,7 @@ import { OAuthError } from './oauth';
 export const PUBLIC_CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name',
   'Access-Control-Expose-Headers': 'WWW-Authenticate, Mcp-Session-Id',
   'Access-Control-Max-Age': '600',
 } as const;
